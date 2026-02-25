@@ -34,9 +34,12 @@ Autoswagger automates the process of finding **OpenAPI/Swagger** specifications,
 
 - **Multiple Discovery Phases**  
   Discovers OpenAPI specs in three ways:
-  1. **Direct Spec**: If a full URL with a path ending in `.json`, `.yaml`, or `.yml` is provided, parse that file directly.  
+  1. **Direct Spec (any URL)**: Always try to fetch and parse the provided URL as a spec, even if it does not end in `.json`, `.yaml`, or `.yml` (e.g. `/v3/api-docs`).  
   2. **Swagger UI**: Parse known paths of Swagger UI (e.g. `/swagger-ui.html`), and extract spec from HTML or JavaScript.  
-  3. **Direct Spec by Bruteforce**: Attempt discovery using common OpenAPI schema locations (`/swagger.json`, `/openapi.json`, etc.). Only attempt this if 1. and 2. did not yield a result.
+  3. **Direct Spec by Bruteforce**: Attempt discovery using common OpenAPI schema locations (`/swagger.json`, `/openapi.json`, `/v3/api-docs`, etc.). Only attempt this if 1. and 2. did not yield a result.
+
+- **Spec Parsing Tolerance**  
+  Accepts common `application/*+json` content types and validates parsed specs by checking for top-level `swagger` or `openapi` keys.
 
 - **Parallel Endpoint Testing**  
   Multi-threaded concurrent testing of many endpoints, respecting a configurable rate limit (`-rate`).
@@ -91,6 +94,7 @@ Autoswagger automates the process of finding **OpenAPI/Swagger** specifications,
 | `-rate <N>`          | Throttles requests to N requests per second. Default is 30. Use 0 to disable rate limiting.                  |
 | `-b, --brute`        | Enables brute-forcing of parameter values (multiple test combos).                                            |
 | `-json`              | Outputs results in JSON format instead of a Rich table in default mode.                                      |
+| `--no-pii`           | Disables Presidio-based PII detection (regex/heuristics still run).                                          |
 
 
 ## Help
@@ -106,7 +110,7 @@ Autoswagger automates the process of finding **OpenAPI/Swagger** specifications,
                               https://intruder.io
                           Find unauthenticated endpoints
 
-usage: autoswagger.py [-h] [-v] [-risk] [-all] [-product] [-stats] [-rate RATE] [-b] [-json] [urls ...]
+usage: autoswagger.py [-h] [-v] [-risk] [-all] [-product] [-stats] [-rate RATE] [-b] [-json] [--no-pii] [urls ...]
 
 Autoswagger: Detect unauthenticated access control issues via Swagger/OpenAPI documentation.
 
@@ -123,15 +127,17 @@ options:
   -rate RATE     Set the rate limit in requests per second (default: 30). Use 0 to disable rate limiting.
   -b, --brute    Enable exhaustive testing of parameter values.
   -json          Output results in JSON format in default mode.
+  --no-pii       Disable Presidio-based PII detection (regex/heuristics still run).
 
 Example usage:
   python autoswagger.py https://api.example.com -v
+  python autoswagger.py https://api.example.com/v3/api-docs -v
 
 ```
 ## Discovery Phases
 
-1. **Direct Spec**  
-   If a provided URL ends with `.json/.yaml/.yml`, Autoswagger **directly** attempts to parse the OpenAPI schema.
+1. **Direct Spec (any URL)**  
+   Autoswagger always attempts to parse the provided URL as an OpenAPI schema first, even if it does not end with `.json/.yaml/.yml` (e.g. `/v3/api-docs`).
 
 2. **Swagger-UI Detection**  
    - Tries known UI paths (e.g., `/swagger-ui.html`).
@@ -139,7 +145,7 @@ Example usage:
    - Can detect embedded configs like `window.swashbuckleConfig`.
 
 3. **Direct Spec by Bruteforce**  
-   - If no spec is found so far, Autoswagger attempts a list of default endpoints like `/swagger.json`, `/openapi.json`, etc.
+   - If no spec is found so far, Autoswagger attempts a list of default endpoints like `/swagger.json`, `/openapi.json`, `/v2/api-docs`, `/v3/api-docs`, etc.
    - Stops when a valid spec is discovered or none are found.
 
 ---
@@ -172,6 +178,7 @@ Example usage:
 1. **Presidio-Based Analysis**  
    - Searches for phone numbers, emails, addresses, names.  
    - Context-based scanning (e.g., CSV headers, key-value lines).
+   - If Presidio cannot initialize in your environment (e.g., missing models or restricted downloads), use `--no-pii` to disable it explicitly and rely on regex/heuristic checks instead.
 
 2. **Secrets & Debug Info**  
    - TruffleHog-like regex checks for API keys, tokens, environment variables.  
@@ -214,4 +221,3 @@ Simple GET endpoints can be triaged using command line tools like curl, but we w
 ## Acknowledgments
 
 Autoswagger is maintained and owned by **[Intruder](https://intruder.io/)**. It was primarily developed by Cale Anderson
-

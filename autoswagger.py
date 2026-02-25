@@ -4,9 +4,11 @@ import argparse
 import json
 import os
 import re
+import ssl
 import sys
 import threading
 import time
+import warnings
 from itertools import product as itertools_product
 from urllib.parse import urljoin, urlencode, urlparse
 
@@ -23,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Import Presidio for PII detection
 from presidio_analyzer import AnalyzerEngine, RecognizerRegistry, Pattern, PatternRecognizer
 
+from requests.adapters import HTTPAdapter
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 from rich.table import Table
@@ -36,13 +39,18 @@ TOTAL_REQUESTS = 0       # Tracks total requests sent by the tool
 SCAN_START_TIME = 0.0    # Records scan start time (for RPS calculation)
 SCAN_END_TIME = 0.0      # Records scan end time (for RPS calculation)
 
-# Initialize Presidio Analyzer with custom recognizers
-registry = RecognizerRegistry()
+# Initialize Rich Console for formatted output
+console = Console()
 
 # Initialize file_handler for log data output
 file_handler = None
 
-def setup_pii_recognizers():
+# Presidio analyzer is initialized lazily to avoid downloading models during --help.
+analyzer = None
+_pii_init_error = None
+_pii_warning_logged = False
+
+def setup_pii_recognizers(registry):
     """
     Adds custom recognizers for Person, Phone, Email, and Address to the Presidio registry
     with context words. Each recognizer uses a pattern and context to detect potential PII.
@@ -101,28 +109,72 @@ def setup_pii_recognizers():
     registry.add_recognizer(email_recognizer)
     registry.add_recognizer(address_recognizer)
 
-# Call setup function to prepare custom PII recognizers
-setup_pii_recognizers()
-
-# Initialize Presidio context-aware enhancer
-from presidio_analyzer.context_aware_enhancers import LemmaContextAwareEnhancer
-
-context_aware_enhancer = LemmaContextAwareEnhancer(
-    context_similarity_factor=0.35,
-    min_score_with_context_similarity=0.4
-)
-
-# Analyzer engine for detection
-analyzer = AnalyzerEngine(
-    registry=registry,
-    context_aware_enhancer=context_aware_enhancer
-)
-
-# Initialize Rich Console for formatted output
-console = Console()
+def init_pii_analyzer():
+    """
+    Lazily initialize the Presidio AnalyzerEngine. If initialization fails,
+    return None and keep the error for optional logging.
+    """
+    global analyzer, _pii_init_error
+    if analyzer is not None or _pii_init_error is not None:
+        return analyzer
+    try:
+        registry = RecognizerRegistry()
+        setup_pii_recognizers(registry)
+        from presidio_analyzer.context_aware_enhancers import LemmaContextAwareEnhancer
+        context_aware_enhancer = LemmaContextAwareEnhancer(
+            context_similarity_factor=0.35,
+            min_score_with_context_similarity=0.4
+        )
+        analyzer = AnalyzerEngine(
+            registry=registry,
+            context_aware_enhancer=context_aware_enhancer
+        )
+        return analyzer
+    except Exception as exc:
+        _pii_init_error = exc
+        return None
 
 # Suppress warnings about unverified HTTPS requests
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWarning)
+if hasattr(urllib3.exceptions, "SNIMissingWarning"):
+    warnings.filterwarnings("ignore", category=urllib3.exceptions.SNIMissingWarning)
+if hasattr(urllib3.exceptions, "InsecurePlatformWarning"):
+    warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecurePlatformWarning)
+
+class InsecureHTTPAdapter(HTTPAdapter):
+    """
+    HTTPAdapter that disables TLS verification and hostname checks.
+    """
+    def __init__(self, ssl_context=None, **kwargs):
+        self.ssl_context = ssl_context
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        if self.ssl_context:
+            pool_kwargs["ssl_context"] = self.ssl_context
+        return super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        if self.ssl_context:
+            proxy_kwargs["ssl_context"] = self.ssl_context
+        return super().proxy_manager_for(proxy, **proxy_kwargs)
+
+def create_insecure_session():
+    """
+    Creates a requests session that skips TLS verification and hostname checks.
+    """
+    session = requests.Session()
+    session.verify = False
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    adapter = InsecureHTTPAdapter(ssl_context=ctx)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+INSECURE_SESSION = create_insecure_session()
 
 # Default request timeout
 TIMEOUT = 10
@@ -165,7 +217,8 @@ DIRECT_SPEC_PATHS = sorted({
     "/spec/swagger.yaml", "/spec/openapi.json", "/spec/openapi.yaml",
     "/api-docs/swagger-ui.json", "/api-docs/swagger-ui.yaml",
     "/api-docs/openapi.json", "/api-docs/openapi.yaml",
-    "/swagger-ui.json", "/swagger-ui.yaml"
+    "/swagger-ui.json", "/swagger-ui.yaml",
+    "/v2/api-docs", "/v3/api-docs", "/api-docs", "/api-docs/"
 })
 
 # Regex patterns for secrets (similar to TruffleHog)
@@ -262,6 +315,16 @@ def log(message, level="INFO"):
         logger.debug(message)
     elif file_handler and level in ["INFO", "WARNING", "CRITICAL", "SUCCESS"]:
         logger.info(message)
+
+def log_request_exception(message, exc, verbose):
+    """
+    Logs request exceptions, suppressing SSL errors to avoid noisy output.
+    """
+    if not verbose:
+        return
+    if isinstance(exc, requests.exceptions.SSLError):
+        return
+    log(f"{message}: {exc}", level="DEBUG")
 
 def print_banner():
     """
@@ -457,7 +520,7 @@ def is_large_response(content):
         pass
     return False
 
-def test_parameter_values(method, base_url_no_path, full_path, parameters, request_body, content_type, rate, include_all, verbose, brute=False):
+def test_parameter_values(method, base_url_no_path, full_path, parameters, request_body, content_type, rate, include_all, verbose, pii_enabled=True, brute=False):
     """
     Tests parameter values for a given method/endpoint.
     If brute is false, only a single default set is tested.
@@ -481,7 +544,7 @@ def test_parameter_values(method, base_url_no_path, full_path, parameters, reque
     if not brute:
         response = send_request(
             method, base_url_no_path, full_path, parameters,
-            value_mapping, request_body, content_type, rate, include_all, verbose
+            value_mapping, request_body, content_type, rate, include_all, verbose, pii_enabled
         )
         return [response] if response else []
 
@@ -509,7 +572,7 @@ def test_parameter_values(method, base_url_no_path, full_path, parameters, reque
                 val_map = {n: v for n, v in zip(value_mapping.keys(), combo)}
                 resp = send_request(
                     method, base_url_no_path, full_path, parameters,
-                    val_map, request_body, content_type, rate, include_all, verbose
+                    val_map, request_body, content_type, rate, include_all, verbose, pii_enabled
                 )
                 if resp:
                     return [resp]
@@ -525,7 +588,7 @@ def test_parameter_values(method, base_url_no_path, full_path, parameters, reque
                     val_map = {n: v for n, v in zip(value_mapping.keys(), combo)}
                     resp = send_request(
                         method, base_url_no_path, full_path, parameters,
-                        val_map, request_body, content_type, rate, include_all, verbose
+                        val_map, request_body, content_type, rate, include_all, verbose, pii_enabled
                     )
                     if resp:
                         max_clen = resp['content_length']
@@ -535,7 +598,7 @@ def test_parameter_values(method, base_url_no_path, full_path, parameters, reque
                             val_map2 = {n: v2 for n, v2 in zip(value_mapping.keys(), combo2)}
                             resp2 = send_request(
                                 method, base_url_no_path, full_path, parameters,
-                                val_map2, request_body, content_type, rate, include_all, verbose
+                                val_map2, request_body, content_type, rate, include_all, verbose, pii_enabled
                             )
                             if resp2 and resp2['content_length'] > max_clen:
                                 max_clen = resp2['content_length']
@@ -543,7 +606,7 @@ def test_parameter_values(method, base_url_no_path, full_path, parameters, reque
                         return [best_response]
     return []
 
-def send_request(method, base_url_no_path, full_path, parameters, value_mapping, request_body, content_type, rate, include_all, verbose):
+def send_request(method, base_url_no_path, full_path, parameters, value_mapping, request_body, content_type, rate, include_all, verbose, pii_enabled=True):
     """
     Sends a request to the computed endpoint, respecting rate limit.
     Decodes the response, checks for secrets, PII (via line-based CSV and key:value scanning),
@@ -575,7 +638,7 @@ def send_request(method, base_url_no_path, full_path, parameters, value_mapping,
             time.sleep(1.0 / rate)  # Rate limiting
         TOTAL_REQUESTS += 1
 
-        response = requests.request(
+        response = INSECURE_SESSION.request(
             method, full_url, headers=headers, data=data,
             verify=False, allow_redirects=False, timeout=TIMEOUT
         )
@@ -602,67 +665,78 @@ def send_request(method, base_url_no_path, full_path, parameters, value_mapping,
         pii_detection_methods = set()
         interesting_response = False
 
-        context_keywords = ["name", "email", "phone", "addr", "tel", "contact", "location"]
+        analyzer_local = None
+        if pii_enabled:
+            analyzer_local = init_pii_analyzer()
+            if analyzer_local is None:
+                global _pii_warning_logged
+                if verbose and not _pii_warning_logged:
+                    _pii_warning_logged = True
+                    log(f"PII detection disabled: failed to initialize Presidio analyzer: {_pii_init_error}", level="WARNING")
+                pii_enabled = False
 
-        # Simple CSV detection: check first line for multiple commas
-        csv_header = []
-        if len(lines) > 0:
-            first_line = lines[0]
-            columns = first_line.split(',')
-            if len(columns) >= 3:
-                csv_header = [col.strip().lower() for col in columns]
+        if pii_enabled and analyzer_local:
+            context_keywords = ["name", "email", "phone", "addr", "tel", "contact", "location"]
 
-        # If CSV header recognized, parse subsequent lines with the same number of columns
-        if csv_header:
-            for idx, line in enumerate(lines):
-                if idx == 0:
-                    continue
-                row_cols = line.split(',')
-                if len(row_cols) == len(csv_header):
-                    for i, col_name in enumerate(csv_header):
-                        for kw in context_keywords:
-                            if kw in col_name:
-                                cell_value = row_cols[i].strip()
-                                pres_res = analyzer.analyze(
-                                    text=cell_value,
-                                    entities=["PERSON","EMAIL_ADDRESS","PHONE_NUMBER","ADDRESS"],
-                                    language='en'
-                                )
-                                if pres_res:
-                                    pii_detected = True
-                                    for ent in pres_res:
-                                        entity_type = ent.entity_type
-                                        entity_value = cell_value[ent.start:ent.end]
-                                        detection_method = 'context'
-                                        pii_data.setdefault(entity_type, {'values': set(), 'detection_methods': set()})
-                                        pii_data[entity_type]['values'].add(entity_value)
-                                        pii_data[entity_type]['detection_methods'].add(detection_method)
-                                        pii_detection_methods.add(detection_method)
+            # Simple CSV detection: check first line for multiple commas
+            csv_header = []
+            if len(lines) > 0:
+                first_line = lines[0]
+                columns = first_line.split(',')
+                if len(columns) >= 3:
+                    csv_header = [col.strip().lower() for col in columns]
 
-        # Also do a naive "key: value" detection line by line
-        for line in lines:
-            if ':' in line:
-                parts = line.split(':', 1)
-                key_part = parts[0].strip().lower()
-                val_part = parts[1].strip()
+            # If CSV header recognized, parse subsequent lines with the same number of columns
+            if csv_header:
+                for idx, line in enumerate(lines):
+                    if idx == 0:
+                        continue
+                    row_cols = line.split(',')
+                    if len(row_cols) == len(csv_header):
+                        for i, col_name in enumerate(csv_header):
+                            for kw in context_keywords:
+                                if kw in col_name:
+                                    cell_value = row_cols[i].strip()
+                                    pres_res = analyzer_local.analyze(
+                                        text=cell_value,
+                                        entities=["PERSON","EMAIL_ADDRESS","PHONE_NUMBER","ADDRESS"],
+                                        language='en'
+                                    )
+                                    if pres_res:
+                                        pii_detected = True
+                                        for ent in pres_res:
+                                            entity_type = ent.entity_type
+                                            entity_value = cell_value[ent.start:ent.end]
+                                            detection_method = 'context'
+                                            pii_data.setdefault(entity_type, {'values': set(), 'detection_methods': set()})
+                                            pii_data[entity_type]['values'].add(entity_value)
+                                            pii_data[entity_type]['detection_methods'].add(detection_method)
+                                            pii_detection_methods.add(detection_method)
 
-                for kw in context_keywords:
-                    if kw in key_part:
-                        pres_res = analyzer.analyze(
-                            text=val_part,
-                            entities=["PERSON","EMAIL_ADDRESS","PHONE_NUMBER","ADDRESS"],
-                            language='en'
-                        )
-                        if pres_res:
-                            pii_detected = True
-                            for ent in pres_res:
-                                entity_type = ent.entity_type
-                                entity_value = val_part[ent.start:ent.end]
-                                detection_method = 'context'
-                                pii_data.setdefault(entity_type, {'values': set(), 'detection_methods': set()})
-                                pii_data[entity_type]['values'].add(entity_value)
-                                pii_data[entity_type]['detection_methods'].add(detection_method)
-                                pii_detection_methods.add(detection_method)
+            # Also do a naive "key: value" detection line by line
+            for line in lines:
+                if ':' in line:
+                    parts = line.split(':', 1)
+                    key_part = parts[0].strip().lower()
+                    val_part = parts[1].strip()
+
+                    for kw in context_keywords:
+                        if kw in key_part:
+                            pres_res = analyzer_local.analyze(
+                                text=val_part,
+                                entities=["PERSON","EMAIL_ADDRESS","PHONE_NUMBER","ADDRESS"],
+                                language='en'
+                            )
+                            if pres_res:
+                                pii_detected = True
+                                for ent in pres_res:
+                                    entity_type = ent.entity_type
+                                    entity_value = val_part[ent.start:ent.end]
+                                    detection_method = 'context'
+                                    pii_data.setdefault(entity_type, {'values': set(), 'detection_methods': set()})
+                                    pii_data[entity_type]['values'].add(entity_value)
+                                    pii_data[entity_type]['detection_methods'].add(detection_method)
+                                    pii_detection_methods.add(detection_method)
 
         if pii_data:
             for entity_type in pii_data:
@@ -737,13 +811,12 @@ def send_request(method, base_url_no_path, full_path, parameters, value_mapping,
         return result
 
     except requests.exceptions.RequestException as e:
-        if verbose:
-            log(f"Error testing {method.upper()} {full_url}: {e}", level="DEBUG")
+        log_request_exception(f"Error testing {method.upper()} {full_url}", e, verbose)
     return None
 
 def test_endpoint(base_url, base_path, path_template, method, parameters, request_body=None,
                   content_type=None, verbose=False, rate=30, include_all=False,
-                  product_mode=False, brute=False):
+                  product_mode=False, pii_enabled=True, brute=False):
     """
     Tests a single endpoint (method + path_template).
     Prepares final path by combining base_path with path_template, then calls test_parameter_values.
@@ -763,7 +836,7 @@ def test_endpoint(base_url, base_path, path_template, method, parameters, reques
         start_time = time.time()
         endpoint_results = test_parameter_values(
             method, base_url_no_path, full_path, parameters,
-            request_body, content_type, rate, include_all, verbose, brute=brute
+            request_body, content_type, rate, include_all, verbose, pii_enabled, brute=brute
         )
         if endpoint_results:
             results.extend(endpoint_results)
@@ -779,7 +852,7 @@ def test_endpoint(base_url, base_path, path_template, method, parameters, reques
 
 def test_endpoints(base_url, base_path, swagger_spec, verbose=False,
                    include_risk=False, include_all=False, product_mode=False,
-                   rate=30, tried_basepath_fallback=False, brute=False):
+                   rate=30, tried_basepath_fallback=False, pii_enabled=True, brute=False):
     """
     Iterates over all paths and methods in the provided swagger_spec.
     Submits tasks to test_endpoint if the method is allowed (GET or others if -risk).
@@ -829,7 +902,7 @@ def test_endpoints(base_url, base_path, swagger_spec, verbose=False,
                             base_url, base_path, path, mthd,
                             parameters, request_body, ct,
                             verbose, rate, include_all,
-                            product_mode=product_mode, brute=brute
+                            product_mode=product_mode, pii_enabled=pii_enabled, brute=brute
                         )
                         future_to_endpoint[fut] = (mthd, path, ct)
                 else:
@@ -845,7 +918,7 @@ def test_endpoints(base_url, base_path, swagger_spec, verbose=False,
                         base_url, base_path, path, mthd,
                         parameters, request_body, 'application/json',
                         verbose, rate, include_all,
-                        product_mode=product_mode, brute=brute
+                        product_mode=product_mode, pii_enabled=pii_enabled, brute=brute
                     )
                     future_to_endpoint[fut] = (mthd, path, 'application/json')
 
@@ -873,7 +946,7 @@ def test_endpoints(base_url, base_path, swagger_spec, verbose=False,
                 fallback = test_endpoints(
                     base_url, '/', swagger_spec, verbose,
                     include_risk, include_all, product_mode=product_mode,
-                    rate=rate, tried_basepath_fallback=True, brute=brute
+                    rate=rate, tried_basepath_fallback=True, pii_enabled=pii_enabled, brute=brute
                 )
                 return fallback
 
@@ -888,18 +961,22 @@ def fetch_swagger_spec(url, verbose=False):
     if verbose:
         log(f"Fetching Swagger/OpenAPI spec directly from {url}", level="DEBUG")
     try:
-        resp = requests.get(url, verify=False, timeout=TIMEOUT)
+        resp = INSECURE_SESSION.get(url, verify=False, timeout=TIMEOUT)
         ctype = resp.headers.get('Content-Type', '').lower()
-        if resp.status_code == 200 and any(x in ctype for x in ['json','yaml','text/plain']):
-            if 'swagger' in resp.text.lower() or 'openapi' in resp.text.lower():
+        if resp.status_code == 200:
+            # Some servers use application/*+json or require Accept headers; try to parse anyway.
+            looks_like_json = 'json' in ctype or '+json' in ctype
+            looks_like_yaml = 'yaml' in ctype or 'text/plain' in ctype
+            if looks_like_json or looks_like_yaml:
                 try:
-                    if 'json' in ctype:
+                    if looks_like_json:
                         spec = resp.json()
                     else:
                         spec = yaml.safe_load(resp.text)
-                    if verbose:
-                        log("Successfully loaded spec.", level="SUCCESS")
-                    return spec
+                    if isinstance(spec, dict) and ('swagger' in spec or 'openapi' in spec):
+                        if verbose:
+                            log("Successfully loaded spec.", level="SUCCESS")
+                        return spec
                 except (json.JSONDecodeError, yaml.YAMLError) as perr:
                     if verbose:
                         log(f"Error decoding spec from {url}: {perr}", level="DEBUG")
@@ -909,8 +986,8 @@ def fetch_swagger_spec(url, verbose=False):
                 log(f"Invalid response from {url}: {resp.status_code}, Content-Type: {ctype}", level="WARNING")
                 log(f"Failed to parse spec from {url}", level="DEBUG")
     except requests.exceptions.RequestException as e:
-        if verbose:
-            log(f"Error fetching Swagger/OpenAPI spec from {url}: {e}", level="DEBUG")
+        log_request_exception(f"Error fetching Swagger/OpenAPI spec from {url}", e, verbose)
+        if verbose and not isinstance(e, requests.exceptions.SSLError):
             log(f"Failed to parse spec from {url}", level="DEBUG")
     return None
 
@@ -925,7 +1002,7 @@ def find_swagger_ui_docs(base_url, verbose=False):
         if verbose:
             log(f"Checking Swagger UI page at {swagger_ui_url}", level="DEBUG")
         try:
-            r = requests.get(swagger_ui_url, verify=False, allow_redirects=False, timeout=TIMEOUT)
+            r = INSECURE_SESSION.get(swagger_ui_url, verify=False, allow_redirects=False, timeout=TIMEOUT)
             if r.status_code == 200 and ('swagger' in r.text.lower() or 'openapi' in r.text.lower()):
                 if verbose:
                     log(f"Swagger UI found at {swagger_ui_url}", level="DEBUG")
@@ -943,7 +1020,7 @@ def find_swagger_ui_docs(base_url, verbose=False):
                             log(f"Spec URL does not have a valid spec extension: {full_spec_url}", level="DEBUG")
                         if full_spec_url.lower().endswith('.js'):
                             try:
-                                js_r = requests.get(full_spec_url, verify=False, timeout=TIMEOUT)
+                                js_r = INSECURE_SESSION.get(full_spec_url, verify=False, timeout=TIMEOUT)
                                 if js_r.status_code == 200:
                                     if verbose:
                                         log(f"Attempting to extract embedded spec from JS file: {full_spec_url}", level="DEBUG")
@@ -953,8 +1030,7 @@ def find_swagger_ui_docs(base_url, verbose=False):
                                             log(f"Extracted embedded Swagger spec from JS file: {full_spec_url}", level="DEBUG")
                                         return emb
                             except requests.exceptions.RequestException as e:
-                                if verbose:
-                                    log(f"Error fetching JS file {full_spec_url}: {e}", level="DEBUG")
+                                log_request_exception(f"Error fetching JS file {full_spec_url}", e, verbose)
                 js_files = re.findall(r'<script\s+src=["\']([^"\']+\.js)["\']', r.text, re.IGNORECASE)
                 if verbose:
                     log(f"Found {len(js_files)} JavaScript files to analyze.", level="DEBUG")
@@ -967,7 +1043,7 @@ def find_swagger_ui_docs(base_url, verbose=False):
                     if verbose:
                         log(f"Fetching JS file: {jsu}", level="DEBUG")
                     try:
-                        js_resp = requests.get(jsu, verify=False, timeout=TIMEOUT)
+                        js_resp = INSECURE_SESSION.get(jsu, verify=False, timeout=TIMEOUT)
                         if js_resp.status_code == 200:
                             spec_url_js = extract_spec_url_from_js(js_resp.text)
                             if spec_url_js:
@@ -981,7 +1057,7 @@ def find_swagger_ui_docs(base_url, verbose=False):
                                 else:
                                     if full_spec_url_js.lower().endswith('.js'):
                                         try:
-                                            nested_js = requests.get(full_spec_url_js, verify=False, timeout=TIMEOUT)
+                                            nested_js = INSECURE_SESSION.get(full_spec_url_js, verify=False, timeout=TIMEOUT)
                                             if nested_js.status_code == 200:
                                                 emb2 = extract_spec_from_js(nested_js.text)
                                                 if emb2 and isinstance(emb2, dict):
@@ -989,16 +1065,14 @@ def find_swagger_ui_docs(base_url, verbose=False):
                                                         log(f"Extracted embedded Swagger spec from nested JS file: {full_spec_url_js}", level="DEBUG")
                                                     return emb2
                                         except requests.exceptions.RequestException as e:
-                                            if verbose:
-                                                log(f"Error fetching nested JS file {full_spec_url_js}: {e}", level="DEBUG")
+                                            log_request_exception(f"Error fetching nested JS file {full_spec_url_js}", e, verbose)
                             emb = extract_spec_from_js(js_resp.text)
                             if emb and isinstance(emb, dict):
                                 if verbose:
                                     log(f"Extracted embedded Swagger spec from JS file: {jsu}", level="DEBUG")
                                 return emb
                     except requests.exceptions.RequestException as e:
-                        if verbose:
-                            log(f"Error fetching JS file {jsu}: {e}", level="DEBUG")
+                        log_request_exception(f"Error fetching JS file {jsu}", e, verbose)
                 spec_url_swash = extract_swashbuckle_config_spec_url(r.text)
                 if spec_url_swash:
                     full_swash_url = urljoin(swagger_ui_url, spec_url_swash)
@@ -1008,8 +1082,7 @@ def find_swagger_ui_docs(base_url, verbose=False):
                     if sp3:
                         return sp3
         except requests.exceptions.RequestException as e:
-            if verbose:
-                log(f"Error checking Swagger UI page at {swagger_ui_url}: {e}", level="DEBUG")
+            log_request_exception(f"Error checking Swagger UI page at {swagger_ui_url}", e, verbose)
     return None
 
 def extract_swashbuckle_config_spec_url(html_text):
@@ -1125,7 +1198,7 @@ def process_input(urls):
         processed.append(url)
     return processed
 
-def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output):
+def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output, pii_enabled=True):
     """
     Main function controlling flow:
     1. Tracks start time
@@ -1165,6 +1238,37 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
         with lock:
             stats["active_hosts"] += 1
 
+        # Try direct fetch first, even if the URL doesn't end with .json/.yaml/.yml
+        swagger_spec = fetch_swagger_spec(base_url, verbose)
+        if swagger_spec:
+            with lock:
+                stats["hosts_with_valid_spec"] += 1
+            if not product_mode:
+                log(f"Spec identified via direct fetch: {base_url}", level="INFO")
+            base_path = '/'
+            if 'servers' in swagger_spec and isinstance(swagger_spec['servers'], list) and swagger_spec['servers']:
+                base_path = swagger_spec['servers'][0].get('url', '/')
+            elif 'basePath' in swagger_spec:
+                base_path = swagger_spec.get('basePath', '/')
+            if not product_mode:
+                log("Scanning endpoints.", level="INFO")
+            rslts = test_endpoints(
+                base_url, base_path, swagger_spec,
+                verbose, include_risk, include_all,
+                product_mode=product_mode, rate=rate, pii_enabled=pii_enabled, brute=brute
+            )
+            del swagger_spec
+            with results_lock:
+                all_results.extend(rslts)
+                if rslts:
+                    stats["hosts_with_valid_endpoint"] += 1
+                    for rr in rslts:
+                        if rr['pii_detected']:
+                            stats["hosts_with_pii"] += 1
+                            stats["pii_detection_methods"].update(rr['pii_detection_methods'])
+                            stats["regexes_found"].update(rr['regex_patterns_found'].values())
+            return
+
         # Check if the URL might be a direct spec (ends with .json/.yaml/.yml)
         if any(base_url.lower().endswith(ext) for ext in ['.json', '.yaml', '.yml']):
             if not product_mode:
@@ -1185,7 +1289,7 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
                 rslts = test_endpoints(
                     base_url, base_path, swagger_spec,
                     verbose, include_risk, include_all,
-                    product_mode=product_mode, rate=rate, brute=brute
+                    product_mode=product_mode, rate=rate, pii_enabled=pii_enabled, brute=brute
                 )
                 del swagger_spec
                 with results_lock:
@@ -1222,7 +1326,7 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
             rslts = test_endpoints(
                 base_url, base_path, swagger_spec,
                 verbose, include_risk, include_all,
-                product_mode=product_mode, rate=rate, brute=brute
+                product_mode=product_mode, rate=rate, pii_enabled=pii_enabled, brute=brute
             )
             del swagger_spec
             with results_lock:
@@ -1259,7 +1363,7 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
                 rslts2 = test_endpoints(
                     base_url, base_path, sws,
                     verbose, include_risk, include_all,
-                    product_mode=product_mode, rate=rate, brute=brute
+                    product_mode=product_mode, rate=rate, pii_enabled=pii_enabled, brute=brute
                 )
                 del sws
                 with results_lock:
@@ -1464,6 +1568,7 @@ if __name__ == "__main__":
     parser.add_argument("-rate", type=int, default=30, help="Set the rate limit in requests per second (default: 30). Use 0 to disable rate limiting.")
     parser.add_argument("-b", "--brute", action="store_true", help="Enable exhaustive testing of parameter values.")
     parser.add_argument("-json", action="store_true", help="Output results in JSON format in default mode.")
+    parser.add_argument("--no-pii", action="store_true", help="Disable Presidio-based PII detection (regex/heuristics still run).")
 
     args = parser.parse_args()
 
@@ -1485,6 +1590,7 @@ if __name__ == "__main__":
     rate = args.rate
     brute = args.brute
     json_output = args.json
+    pii_enabled = not args.no_pii
 
     # Set up file logging if verbose is enabled
     if verbose:
@@ -1498,4 +1604,4 @@ if __name__ == "__main__":
         logger.addHandler(file_handler)
         logger.propagate = False
 
-    main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output)
+    main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output, pii_enabled)
