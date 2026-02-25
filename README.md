@@ -1,3 +1,6 @@
+### This is a modified autoswagger for handling better SSL cases where interception is causing problems, allow --no-pii also for no requirement on downloading the spaCy models and relaxed handling on the openapi files, handling more locations and direct input on the url of the location of the file.
+#### The rest of the content is kept as it's on the original which can be found at https://github.com/intruder-io/autoswagger - Nicolas
+
 # [Autoswagger](https://www.intruder.io/research/broken-authorization-apis-autoswagger) by [Intruder](https://intruder.io/)
 <a href="https://intruder.io/">
   <img width="966" alt="output" src="https://github.com/user-attachments/assets/e502abaf-426c-4fab-ad60-d7b5dcd730d8" />
